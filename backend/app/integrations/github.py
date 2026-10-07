@@ -6,8 +6,7 @@ class GitHubService:
         self.token = token
 
     async def check(self) -> str:
-        if not self.token:
-            return "not_configured"
-        return await safe_status("https://api.github.com/user", headers={
-            "Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
-            "User-Agent": "ProspectIQ/0.1"})
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "ScoutBase/0.1"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return await safe_status("https://api.github.com/orgs/github", headers=headers)

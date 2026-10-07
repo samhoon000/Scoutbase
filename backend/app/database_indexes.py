@@ -6,6 +6,7 @@ INDEXES = {
         ("domain_unique", [("domain", ASCENDING)], {"unique": True, "partialFilterExpression": {"domain": {"$type": "string"}}}),
         ("external_key_unique", [("external_keys", ASCENDING)], {"unique": True, "partialFilterExpression": {"external_keys": {"$type": "string"}}}),
         ("name_country", [("name_normalized", ASCENDING), ("location.country_code", ASCENDING)], {}),
+        ("name_country_city", [("name_normalized", ASCENDING), ("location.country_code", ASCENDING), ("location.city", ASCENDING)], {}),
         ("website", [("website", ASCENDING)], {}),
         ("linkedin_url", [("linkedin_url", ASCENDING)], {}),
         ("country_industry_score", [("location.country_code", ASCENDING), ("industry", ASCENDING), ("prospect_score", DESCENDING)], {}),
@@ -17,7 +18,6 @@ INDEXES = {
         ("funding_recent", [("funding.last_funding_date", DESCENDING)], {}),
         ("prospect_score", [("prospect_score", DESCENDING)], {}),
         ("growth_score", [("signals.growth_score", DESCENDING)], {}),
-        ("demo", [("demo", ASCENDING)], {}),
     ],
     "funding_rounds": [
         ("company_date", [("company_id", ASCENDING), ("date", DESCENDING)], {}),

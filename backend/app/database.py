@@ -7,10 +7,7 @@ from .database_indexes import INDEXES, REQUIRED_COLLECTIONS
 @lru_cache
 def client() -> MongoClient:
     if not settings.mongodb_uri:
-        if settings.demo_mode:
-            import mongomock
-            return mongomock.MongoClient()
-        raise RuntimeError("MONGODB_URI is required when DEMO_MODE=false")
+        raise RuntimeError("MONGODB_URI is required for live company data")
     return MongoClient(settings.mongodb_uri, serverSelectionTimeoutMS=4000)
 
 

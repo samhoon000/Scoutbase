@@ -3,6 +3,8 @@ from urllib.parse import urlparse
 
 
 SUFFIXES = re.compile(r"\b(incorporated|corporation|company|limited|technologies|technology|private|pvt|inc|corp|ltd|llc|gmbh|ag|plc)\b", re.I)
+SOURCE_CONFIDENCE = {"official API": 0.95, "company website": 0.9,
+    "open dataset": 0.8, "public API": 0.7, "secondary": 0.5}
 
 
 def normalized_name(value: str) -> str:
@@ -31,7 +33,8 @@ def safe_public_url(value: str | None) -> str | None:
 
 
 def source_record(candidate, fields: list[str]) -> dict:
+    confidence = SOURCE_CONFIDENCE.get(candidate.source_type, 0.5)
     return {"source_name": candidate.source_name, "source_url": candidate.source_url,
             "source_type": candidate.source_type, "fields_provided": fields,
             "collected_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
-            "confidence": 1.0 if candidate.source_type == "official API" else 0.7}
+            "confidence": confidence}
