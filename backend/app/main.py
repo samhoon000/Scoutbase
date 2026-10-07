@@ -3,6 +3,7 @@ from datetime import timedelta
 from io import BytesIO, StringIO
 import csv
 import json
+import re
 import uuid
 from bson import ObjectId
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
@@ -12,12 +13,12 @@ from openpyxl import Workbook
 from pymongo import ASCENDING, DESCENDING
 from .config import settings
 from .database import db, initialize
-from .demo import seed_demo
 from .diagnostics import provider_status
-from .models import OutreachInput, SavedInput, SearchCriteria, SearchInput, now
-from .pipeline import run_discovery
+from .filter_taxonomy import industry_aliases
+from .models import OutreachInput, SavedInput, SearchCriteria, SearchInput, SearchRenameInput, now
+from .pipeline import run_discovery, run_enrichment
 
-USER_ID = "local-demo-user"  # Replace with authenticated principal in auth middleware.
+USER_ID = "local-user"  # Replace with authenticated principal in auth middleware.
 SORTS = {"prospect_score", "funding.total_amount_usd", "employees.min", "founded_year", "funding.last_funding_date", "signals.growth_score", "signals.analytics_opportunity_score"}
 STATUSES = {"new", "researching", "contacted", "follow-up", "responded", "rejected", "interested", "converted"}
 
@@ -42,26 +43,57 @@ def company_id(value):
 
 def mongo_filter(criteria: SearchCriteria):
     q = {}
+    clauses = []
     if criteria.query:
         q["name"] = {"$regex": __import__("re").escape(criteria.query[:100]), "$options": "i"}
-    if criteria.country_code:
-        q["location.country_code"] = criteria.country_code.upper()
+    selected_countries = [x.upper() for x in (criteria.countries or ([criteria.country_code] if criteria.country_code else []))]
+    if selected_countries:
+        q["location.country_code"] = {"$in": selected_countries}
     if criteria.region:
         q["location.region"] = criteria.region
     if criteria.city:
         q["location.city"] = criteria.city
-    if criteria.industry:
-        q["industry"] = {"$regex": "^" + __import__("re").escape(criteria.industry) + "$", "$options": "i"}
-    for key, value, operator in (("employees.max", criteria.employees_min, "$gte"), ("employees.min", criteria.employees_max, "$lte"),
-        ("funding.total_amount_usd", criteria.funding_min, "$gte"), ("funding.total_amount_usd", criteria.funding_max, "$lte"),
+    selected_industries = criteria.industries or ([criteria.industry] if criteria.industry else [])
+    if selected_industries:
+        names = set().union(*(industry_aliases(value) for value in selected_industries))
+        q["industry"] = {"$in": [re.compile("^" + re.escape(value) + "$", re.I) for value in names]}
+    if criteria.company_types:
+        q["business_model"] = {"$in": [re.compile("^" + re.escape(value) + "$", re.I) for value in criteria.company_types]}
+    if criteria.employees_min is not None or criteria.employees_max is not None:
+        exact = {}
+        interval = {}
+        if criteria.employees_min is not None:
+            exact["$gte"] = criteria.employees_min
+            interval["employees.max"] = {"$gte": criteria.employees_min}
+        if criteria.employees_max is not None:
+            exact["$lte"] = criteria.employees_max
+            interval["employees.min"] = {"$lte": criteria.employees_max}
+        clauses.append({"$or": [{"employees.exact": exact}, {**interval, "employees.exact": {"$exists": False}}]})
+    for key, value, operator in (("funding.total_amount_usd", criteria.funding_min, "$gte"), ("funding.total_amount_usd", criteria.funding_max, "$lte"),
         ("funding.last_round.amount_usd", criteria.latest_round_min, "$gte"), ("funding.last_round.amount_usd", criteria.latest_round_max, "$lte"),
-        ("founded_year", criteria.founded_min, "$gte"), ("founded_year", criteria.founded_max, "$lte"), ("prospect_score", criteria.score_min, "$gte")):
+        ("founded_year", criteria.founded_min, "$gte"), ("founded_year", criteria.founded_max, "$lte"),
+        ("prospect_score", criteria.score_min, "$gte"), ("signals.growth_score", criteria.growth_score_min, "$gte")):
         if value is not None:
             q.setdefault(key, {})[operator] = value
     if criteria.funding_stage:
         q["funding.funding_stage"] = criteria.funding_stage
     if criteria.funded_within_months:
         q.setdefault("funding.last_funding_date", {})["$gte"] = now() - timedelta(days=criteria.funded_within_months * 30)
+    if criteria.recently_founded_years:
+        q.setdefault("founded_year", {})["$gte"] = now().year - criteria.recently_founded_years
+    if criteria.active_company:
+        q["company_status"] = {"$in": [re.compile("^active$", re.I), re.compile("^operating$", re.I)]}
+    if criteria.growing_headcount:
+        q["signals.growing_headcount"] = True
+    if criteria.multiple_growth_signals:
+        q["signals.multiple_growth_signals"] = True
+    if criteria.analytics_opportunity_min is not None:
+        q["signals.analytics_opportunity_score"] = {"$gte": criteria.analytics_opportunity_min}
+    for field in ("high_transaction_volume", "large_customer_base", "multiple_products", "operational_data_heavy"):
+        if getattr(criteria, field):
+            q[f"opportunity_evidence.{field}"] = True
+    if clauses:
+        q["$and"] = clauses
     return q
 
 
@@ -76,19 +108,18 @@ def list_companies(criteria):
 @asynccontextmanager
 async def lifespan(app):
     initialize()
-    if settings.demo_mode:
-        seed_demo()
     yield
 
 
-app = FastAPI(title="ProspectIQ API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="ScoutBase API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=[x.strip() for x in settings.cors_origins.split(",")], allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type"])
 
 
 @app.get("/api/health")
 def health():
     db().command("ping")
-    return {"ok": True, "demo_mode": settings.demo_mode, "database": "MongoDB" if settings.mongodb_uri else "in-memory demo"}
+    from .integrations.sec import has_declared_contact
+    return {"ok": True, "database": "MongoDB", "sec_enrichment_configured": has_declared_contact(settings.sec_user_agent)}
 
 
 @app.get("/api/health/providers")
@@ -108,7 +139,7 @@ def search(criteria: SearchCriteria):
 
 @app.get("/api/companies/{id}")
 def company(id: str):
-    result = db().companies.find_one({"_id": company_id(id)})
+    result = db().companies.find_one({"_id": company_id(id), **mongo_filter(SearchCriteria())})
     if not result:
         raise HTTPException(404, "Company not found")
     return clean(result)
@@ -116,13 +147,43 @@ def company(id: str):
 
 @app.post("/api/companies/discover")
 async def discover(criteria: SearchCriteria, tasks: BackgroundTasks):
-    if settings.demo_mode and not settings.mongodb_uri:
-        raise HTTPException(400, "Live discovery requires MongoDB. Demo records remain searchable.")
-    if not criteria.query.strip():
-        raise HTTPException(400, "Enter a company name or keyword for the available free providers")
+    if not (criteria.query.strip() or criteria.industry or criteria.country_code or criteria.industries or criteria.countries):
+        raise HTTPException(400, "Enter a company name, industry, or country")
+    if len(criteria.countries) > 1 or len(criteria.industries) > 1:
+        raise HTTPException(400, "External discovery currently supports one country and one industry per run; stored search supports multiple")
+    discovery_criteria = criteria.model_copy(update={
+        "country_code": criteria.countries[0] if criteria.countries else criteria.country_code,
+        "industry": criteria.industries[0] if criteria.industries else criteria.industry,
+    })
+    criteria_key = json.dumps(criteria.model_dump(exclude={"force_refresh", "page", "page_size", "sort", "order"}), sort_keys=True)
+    if not criteria.force_refresh:
+        active = db().discovery_jobs.find_one({"criteria_key": criteria_key, "status": {"$in": ["queued", "running"]}},
+            sort=[("created_at", DESCENDING)])
+        if active:
+            return {"job_id": active["_id"], "reused": True}
+        recent = db().discovery_jobs.find_one({"criteria_key": criteria_key, "status": "completed", "errors": [],
+            "completed_at": {"$gte": now() - timedelta(days=settings.refresh_days)}}, sort=[("completed_at", DESCENDING)])
+        if recent:
+            return {"job_id": recent["_id"], "reused": True}
+    existing = db().companies.count_documents(mongo_filter(criteria))
+    if not criteria.force_refresh and existing >= criteria.page_size:
+        stale_query = {"$and": [mongo_filter(criteria), {"$or": [
+            {"last_verified_at": {"$lt": now() - timedelta(days=settings.refresh_days)}},
+            {"last_verified_at": {"$exists": False}},
+        ]}]}
+        if db().companies.count_documents(stale_query) == 0:
+            job_id = str(uuid.uuid4())
+            db().discovery_jobs.insert_one({"_id": job_id, "status": "completed", "stage": "Sufficient fresh stored matches",
+                "progress": 100, "criteria": criteria.model_dump(), "criteria_key": criteria_key, "existing": existing,
+                "found": 0, "valid_candidates": 0, "duplicates": 0, "unique_companies": 0,
+                "rejected_candidates": 0, "enriched": 0, "provider_status": {}, "errors": [],
+                "created_at": now(), "completed_at": now()})
+            return {"job_id": job_id, "reused": True}
     job_id = str(uuid.uuid4())
-    db().discovery_jobs.insert_one({"_id": job_id, "status": "queued", "stage": "Queued", "progress": 0, "criteria": criteria.model_dump(), "created_at": now(), "errors": []})
-    tasks.add_task(run_discovery, job_id, criteria)
+    db().discovery_jobs.insert_one({"_id": job_id, "status": "queued", "stage": "Queued", "progress": 0,
+        "criteria": criteria.model_dump(), "criteria_key": criteria_key, "existing": existing,
+        "created_at": now(), "errors": [], "provider_status": {}})
+    tasks.add_task(run_discovery, job_id, discovery_criteria)
     return {"job_id": job_id}
 
 
@@ -135,22 +196,46 @@ def job(id: str):
 
 
 @app.post("/api/companies/{id}/enrich")
-def enrich(id: str):
-    result = db().companies.find_one({"_id": company_id(id)})
+def enrich(id: str, tasks: BackgroundTasks, force_refresh: bool = False):
+    result = db().companies.find_one({"_id": company_id(id), **mongo_filter(SearchCriteria())})
     if not result:
         raise HTTPException(404, "Company not found")
-    # Discovery adapters presently provide all fields they can verify. Refresh is a new discovery by legal name.
-    return {"message": "Use discovery with the company name to refresh official sources", "last_enriched_at": clean(result.get("last_enriched_at"))}
+    recent = result.get("last_enriched_at")
+    if recent and not force_refresh and recent >= now() - timedelta(days=settings.refresh_days):
+        return {"status": "fresh", "last_enriched_at": clean(recent)}
+    job_id = str(uuid.uuid4())
+    db().discovery_jobs.insert_one({"_id": job_id, "status": "queued", "stage": "Queued", "progress": 0,
+        "company_id": id, "created_at": now(), "errors": [], "provider_status": {}})
+    tasks.add_task(run_enrichment, job_id, id)
+    return {"job_id": job_id}
 
 
 @app.get("/api/industries")
 def industries():
-    return sorted(x for x in db().companies.distinct("industry") if x)
+    return sorted(x for x in db().companies.distinct("industry", mongo_filter(SearchCriteria())) if x)
 
 
 @app.get("/api/countries")
 def countries():
-    return sorted(x for x in db().companies.distinct("location.country_code") if x)
+    return sorted(x for x in db().companies.distinct("location.country_code", mongo_filter(SearchCriteria())) if x)
+
+
+@app.get("/api/filter-options")
+def filter_options():
+    visible = mongo_filter(SearchCriteria())
+    collection = db().companies
+    industries = sorted(x for x in collection.distinct("industry", visible) if x)
+    countries = sorted(x for x in collection.distinct("location.country_code", visible) if x)
+    regions = sorted(x for x in collection.distinct("location.region", visible) if x)
+    cities = sorted(x for x in collection.distinct("location.city", visible) if x)
+    models = sorted(x for x in collection.distinct("business_model", visible) if x)
+    funding_stages = sorted(x for x in collection.distinct("funding.funding_stage", visible) if x)
+    coverage = {field: collection.count_documents({**visible, field: {"$exists": True, "$ne": None}})
+                for field in ("company_status", "signals.growing_headcount", "signals.multiple_growth_signals",
+                              "opportunity_evidence.high_transaction_volume", "opportunity_evidence.large_customer_base",
+                              "opportunity_evidence.multiple_products", "opportunity_evidence.operational_data_heavy")}
+    return {"industries": industries, "countries": countries, "regions": regions, "cities": cities,
+            "company_types": models, "funding_stages": funding_stages, "coverage": coverage}
 
 
 @app.get("/api/saved-companies")
@@ -161,7 +246,7 @@ def saved():
 @app.post("/api/saved-companies")
 def save(data: SavedInput):
     company_id(data.company_id)
-    if not db().companies.find_one({"_id": ObjectId(data.company_id)}):
+    if not db().companies.find_one({"_id": ObjectId(data.company_id), **mongo_filter(SearchCriteria())}):
         raise HTTPException(404, "Company not found")
     if data.status not in STATUSES or data.priority not in {"low", "medium", "high"}:
         raise HTTPException(400, "Invalid status or priority")
@@ -206,6 +291,14 @@ def searches():
     return clean(list(db().searches.find({"user_id": USER_ID}).sort("created_at", DESCENDING)))
 
 
+@app.get("/api/searches/{id}")
+def get_search(id: str):
+    result = db().searches.find_one({"_id": company_id(id), "user_id": USER_ID})
+    if not result:
+        raise HTTPException(404, "Search not found")
+    return clean(result)
+
+
 @app.post("/api/searches")
 def add_search(data: SearchInput):
     doc = {"user_id": USER_ID, "name": data.name, "criteria": data.criteria.model_dump(), "created_at": now()}
@@ -219,21 +312,31 @@ def delete_search(id: str):
     return {"ok": True}
 
 
+@app.patch("/api/searches/{id}")
+def rename_search(id: str, data: SearchRenameInput):
+    result = db().searches.find_one_and_update({"_id": company_id(id), "user_id": USER_ID},
+        {"$set": {"name": data.name.strip(), "updated_at": now()}}, return_document=True)
+    if not result:
+        raise HTTPException(404, "Search not found")
+    return clean(result)
+
+
 @app.get("/api/dashboard")
 def dashboard():
     companies = db().companies
     saved = db().saved_companies
     outreach = db().outreach
-    pipeline = [{"$unwind": "$industry"}, {"$group": {"_id": "$industry", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}, {"$limit": 8}]
-    countries = [{"$group": {"_id": "$location.country_code", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}, {"$limit": 8}]
-    scores = list(companies.aggregate([{"$group": {"_id": None, "average": {"$avg": "$prospect_score"}}}]))
-    return {"companies": companies.count_documents({}), "saved": saved.count_documents({"user_id": USER_ID}),
-            "high_potential": companies.count_documents({"prospect_score": {"$gte": 80}}),
-            "recently_funded": companies.count_documents({"funding.last_funding_date": {"$gte": now() - timedelta(days=730)}}),
+    visible = mongo_filter(SearchCriteria())
+    pipeline = [{"$match": visible}, {"$unwind": "$industry"}, {"$group": {"_id": "$industry", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}, {"$limit": 8}]
+    countries = [{"$match": visible}, {"$group": {"_id": "$location.country_code", "count": {"$sum": 1}}}, {"$sort": {"count": -1}}, {"$limit": 8}]
+    scores = list(companies.aggregate([{"$match": visible}, {"$group": {"_id": None, "average": {"$avg": "$prospect_score"}}}]))
+    return {"companies": companies.count_documents(visible), "saved": saved.count_documents({"user_id": USER_ID}),
+            "high_potential": companies.count_documents({**visible, "prospect_score": {"$gte": 80}}),
+            "recently_funded": companies.count_documents({**visible, "funding.last_funding_date": {"$gte": now() - timedelta(days=730)}}),
             "contacted": outreach.count_documents({"user_id": USER_ID, "status": {"$in": ["contacted", "follow-up", "responded", "interested", "converted"]}}),
             "responses": outreach.count_documents({"user_id": USER_ID, "status": {"$in": ["responded", "interested", "converted"]}}),
             "average_score": round(scores[0]["average"] or 0) if scores else 0,
-            "industries": list(companies.aggregate(pipeline)), "countries": list(companies.aggregate(countries)), "demo_mode": settings.demo_mode}
+            "industries": list(companies.aggregate(pipeline)), "countries": list(companies.aggregate(countries))}
 
 
 EXPORT_COLUMNS = [("Company", lambda c: c.get("name")), ("Website", lambda c: c.get("website")), ("LinkedIn", lambda c: c.get("linkedin_url")),
@@ -241,10 +344,14 @@ EXPORT_COLUMNS = [("Company", lambda c: c.get("name")), ("Website", lambda c: c.
     ("Industry", lambda c: ", ".join(c.get("industry", []))), ("Employees", lambda c: c.get("employees", {}).get("exact") or c.get("employees", {}).get("min")),
     ("Total Funding USD", lambda c: c.get("funding", {}).get("total_amount_usd")), ("Last Funding", lambda c: c.get("funding", {}).get("last_funding_date")),
     ("Founded", lambda c: c.get("founded_year")), ("Founders", lambda c: ", ".join(p.get("name", "") for p in c.get("founders", []))),
+    ("Contact Person", lambda c: (c.get("founders") or c.get("executives") or [{}])[0].get("name")),
+    ("Contact LinkedIn", lambda c: (c.get("founders") or c.get("executives") or [{}])[0].get("linkedin_url")),
     ("Prospect Score", lambda c: c.get("prospect_score")), ("Growth Score", lambda c: c.get("signals", {}).get("growth_score")),
+    ("Data Intensity", lambda c: c.get("signals", {}).get("data_intensity_score")),
     ("Analytics Opportunity", lambda c: c.get("signals", {}).get("analytics_opportunity_score")),
     ("Prospect Reason", lambda c: "; ".join(c.get("prospect_reason", []))),
     ("Potential Projects", lambda c: "; ".join(c.get("potential_analytics_projects", []))),
+    ("Data Confidence", lambda c: c.get("data_confidence")),
     ("Source", lambda c: "; ".join(s.get("source_name", "") for s in c.get("sources", [])))]
 
 
@@ -261,7 +368,7 @@ def safe_export_cell(value):
 @app.get("/api/export")
 def export(format: str = "csv", ids: str = ""):
     selected = [company_id(x) for x in ids.split(",") if x] if ids else []
-    query = {"_id": {"$in": selected}} if selected else {}
+    query = {**mongo_filter(SearchCriteria()), **({"_id": {"$in": selected}} if selected else {})}
     records = list(db().companies.find(query).limit(10000))
     rows = [[safe_export_cell(getter(c)) for _, getter in EXPORT_COLUMNS] for c in records]
     if format == "xlsx":
