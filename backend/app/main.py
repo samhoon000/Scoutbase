@@ -13,6 +13,7 @@ from pymongo import ASCENDING, DESCENDING
 from .config import settings
 from .database import db, initialize
 from .demo import seed_demo
+from .diagnostics import provider_status
 from .models import OutreachInput, SavedInput, SearchCriteria, SearchInput, now
 from .pipeline import run_discovery
 
@@ -90,6 +91,11 @@ def health():
     return {"ok": True, "demo_mode": settings.demo_mode, "database": "MongoDB" if settings.mongodb_uri else "in-memory demo"}
 
 
+@app.get("/api/health/providers")
+async def health_providers():
+    return await provider_status()
+
+
 @app.get("/api/companies")
 def companies(criteria: SearchCriteria = __import__("fastapi").Depends()):
     return list_companies(criteria)
@@ -115,14 +121,14 @@ async def discover(criteria: SearchCriteria, tasks: BackgroundTasks):
     if not criteria.query.strip():
         raise HTTPException(400, "Enter a company name or keyword for the available free providers")
     job_id = str(uuid.uuid4())
-    db().jobs.insert_one({"_id": job_id, "status": "queued", "stage": "Queued", "progress": 0, "criteria": criteria.model_dump(), "created_at": now(), "errors": []})
+    db().discovery_jobs.insert_one({"_id": job_id, "status": "queued", "stage": "Queued", "progress": 0, "criteria": criteria.model_dump(), "created_at": now(), "errors": []})
     tasks.add_task(run_discovery, job_id, criteria)
     return {"job_id": job_id}
 
 
 @app.get("/api/jobs/{id}")
 def job(id: str):
-    result = db().jobs.find_one({"_id": id})
+    result = db().discovery_jobs.find_one({"_id": id})
     if not result:
         raise HTTPException(404, "Job not found")
     return clean(result)

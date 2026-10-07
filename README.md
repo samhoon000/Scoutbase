@@ -4,12 +4,11 @@ ProspectIQ is an MVP for researching companies that may benefit from analytics w
 
 ## Run locally
 
-Requirements: Python 3.11+, Node 20+, npm. MongoDB Atlas is needed for persistent data and live discovery. The default demo mode uses an in-memory MongoDB compatible store so the UI and workflow can be explored without credentials; it resets on restart.
+Requirements: Python 3.11+, Node 20+, npm. MongoDB Atlas supplies persistent storage. Configuration is loaded from the project root `.env`, with optional overrides in `backend/.env`. When `MONGODB_URI` is absent and `DEMO_MODE=true`, the backend falls back to an in-memory MongoDB compatible store that resets on restart. The current workspace has Atlas configured, and `backend/.env` selects `DATABASE_NAME=prospectiq` without copying credentials.
 
 ```powershell
 cd backend
 python -m pip install -r requirements.txt
-Copy-Item .env.example .env
 python -m uvicorn app.main:app --reload --port 8000
 ```
 
@@ -18,13 +17,23 @@ In another terminal:
 ```powershell
 cd frontend
 npm install
-Copy-Item .env.example .env.local
 npm run dev
 ```
 
 Open `http://localhost:3000`. API docs are at `http://localhost:8000/docs`.
 
-For MongoDB Atlas, create a database user, allow the application's network address, and put the `mongodb+srv://...` URI in `backend/.env`. Set `DEMO_MODE=false` to avoid inserting synthetic records and enable live discovery. The API creates indexes on startup. Keep database credentials server-side. Atlas availability cannot be verified until a URI is supplied.
+For a new installation, copy `.env.example` to the project root `.env`, provide a MongoDB Atlas URI, and set `DATABASE_NAME=prospectiq`. The backend creates missing collections and indexes on startup. `DEMO_MODE=true` seeds 80 synthetic records once; set it to `false` to avoid demo inserts. Secrets must stay server-side. The only frontend setting is the public `NEXT_PUBLIC_API_URL`, which defaults to `http://localhost:8000` and may be set in `frontend/.env.local`.
+
+Initialize or inspect the database without starting the server:
+
+```powershell
+cd backend
+python -c "from app.database import initialize; print(initialize())"
+python -m app.scripts.seed_demo
+python -m app.scripts.diagnose
+```
+
+Initialization is idempotent. It creates `companies`, `funding_rounds`, `people`, `sources`, `saved_companies`, `outreach`, `searches`, `discovery_jobs`, `provider_cache`, and `api_usage`. The 28 named index definitions are in [`backend/app/database_indexes.py`](backend/app/database_indexes.py), including identity/domain, country/industry/score, employee and funding filters, people and source lookup, user workflow, job status, cache TTL, and API usage. No existing documents are deleted or overwritten during initialization. The seed command skips when demo records already exist.
 
 ## Provider selection (checked 7 October 2026)
 
@@ -55,18 +64,20 @@ The six configurable factors in `backend/app/scoring.py` total 100 points: fundi
 
 ## Demo and API
 
-Demo mode generates 80 **fictional** records across 8 countries and 10 industries. Every record has a `demo` flag and a demo source; the UI displays `DEMO DATA`. Search, filters, sorting, pagination, detail pages, saving, outreach, dashboard, and export work without external credentials. Demo funding values are synthetic only.
+Demo mode generates 80 **fictional** records across 10 countries and 11 industries. Every record has `demo` and `is_demo` flags and a demo source; the UI displays `DEMO DATA`. Search, filters, sorting, pagination, detail pages, saving, outreach, dashboard, and export work without external provider credentials. Demo funding values, stages, and rounds are synthetic only.
 
-Key endpoints: `/api/health`, `/api/companies`, `/api/companies/search`, `/api/companies/{id}`, `/api/companies/discover`, `/api/jobs/{id}`, `/api/saved-companies`, `/api/outreach`, `/api/searches`, `/api/dashboard`, `/api/export?format=csv|xlsx`. OpenAPI documentation covers request and response shapes. Exports accept comma-separated IDs and cap at 10,000 records.
+Key endpoints: `/api/health`, `/api/health/providers`, `/api/companies`, `/api/companies/search`, `/api/companies/{id}`, `/api/companies/discover`, `/api/jobs/{id}`, `/api/saved-companies`, `/api/outreach`, `/api/searches`, `/api/dashboard`, `/api/export?format=csv|xlsx`. The provider health endpoint returns only fixed status labels; it never returns credentials. GitHub and SEC currently have separate server-side connectivity services, but they are not used as startup funding sources. OpenAPI documentation covers request and response shapes. Exports accept comma-separated IDs and cap at 10,000 records.
 
 ## Tests and limitations
 
 ```powershell
 cd backend
 python -m pytest -q
+python -m app.scripts.verify_workflow
+python -m app.scripts.diagnose
 $env:PYTHONPATH='.'; python scripts/check_providers.py
 cd ../frontend
 npm run build
 ```
 
-The app has no real user authentication; workflow records use one local development identity. Do not expose the API publicly until authentication, user isolation, request rate limiting, and a durable worker are implemented. MongoDB Atlas was not connected in this workspace because no URI was provided. The no-key provider smoke check verifies endpoint access, not long-term data coverage. Private startup funding, employee counts, and founders remain sparse with these free sources. The `POST /api/companies/{id}/enrich` endpoint currently explains how to refresh via discovery; it is not an independent enrichment job.
+The app has no real user authentication; workflow records use one local development identity. Do not expose the API publicly until authentication, user isolation, request rate limiting, and a durable worker are implemented. Atlas connection, initialization, seeding, and the temporary-user workflow were verified in this workspace. Companies House currently returns HTTP 401 with the locally configured key and must be corrected before that adapter can provide live data. GitHub and SEC connectivity checks passed. The no-key provider smoke check verifies endpoint access, not long-term data coverage. Private startup funding, employee counts, and founders remain sparse with these free sources. The `POST /api/companies/{id}/enrich` endpoint currently explains how to refresh via discovery; it is not an independent enrichment job.

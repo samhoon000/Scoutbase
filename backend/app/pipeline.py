@@ -10,6 +10,20 @@ from .scoring import score_company
 log = logging.getLogger(__name__)
 
 
+def persist_related(company_id, candidate: CompanyCandidate, source: dict):
+    database = db()
+    database.sources.update_one({"company_id": company_id, "source_url": source["source_url"]},
+        {"$set": {"company_id": company_id, **source}}, upsert=True)
+    for person in candidate.founders + candidate.executives:
+        if not person.get("name"):
+            continue
+        identity = {"company_id": company_id, "name": person["name"], "role": person.get("role"), "source_url": source["source_url"]}
+        database.people.update_one(identity, {"$set": {**identity, "verified_at": source["collected_at"]}}, upsert=True)
+    for round_data in candidate.funding.get("rounds", []):
+        identity = {"company_id": company_id, "date": round_data.get("date"), "round_type": round_data.get("round_type"), "source_url": source["source_url"]}
+        database.funding_rounds.update_one(identity, {"$set": {**round_data, **identity}}, upsert=True)
+
+
 def upsert_candidate(candidate: CompanyCandidate):
     database = db()
     candidate.website = safe_public_url(candidate.website)
@@ -43,20 +57,25 @@ def upsert_candidate(candidate: CompanyCandidate):
             elif previous.get(field) in (None, "", []):
                 changes[field] = supplied[field]
         changes["updated_at"] = now()
+        for field in ("founders", "executives", "industry", "sub_industries", "business_model", "other_urls"):
+            if supplied.get(field):
+                changes[field] = list({str(item): item for item in (previous.get(field) or []) + supplied[field]}.values())
         merged_doc = {**previous, **changes}
         changes.update(score_company(merged_doc))
         database.companies.update_one({"_id": previous["_id"]}, {"$set": changes, "$addToSet": {"sources": source, "external_keys": {"$each": keys}}})
+        persist_related(previous["_id"], candidate, source)
         return str(previous["_id"]), False
     document = {**supplied, "domain": domain, "external_keys": keys, "name_normalized": name_key,
-                "sources": [source], "demo": candidate.demo, "first_discovered_at": now(), "last_enriched_at": now(),
+                "sources": [source], "demo": candidate.demo, "is_demo": candidate.demo, "first_discovered_at": now(), "last_enriched_at": now(),
                 "last_verified_at": now(), "created_at": now(), "updated_at": now()}
     document.update(score_company(document))
     result = database.companies.insert_one(document)
+    persist_related(result.inserted_id, candidate, source)
     return str(result.inserted_id), True
 
 
 async def run_discovery(job_id: str, criteria: SearchCriteria):
-    jobs = db().jobs
+    jobs = db().discovery_jobs
     jobs.update_one({"_id": job_id}, {"$set": {"status": "running", "stage": "Searching sources", "progress": 10}})
     found = 0
     inserted = 0

@@ -1,6 +1,7 @@
 from functools import lru_cache
-from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo import MongoClient
 from .config import settings
+from .database_indexes import INDEXES, REQUIRED_COLLECTIONS
 
 
 @lru_cache
@@ -17,25 +18,27 @@ def db():
     return client()[settings.database_name]
 
 
-def initialize() -> None:
+def initialize() -> dict:
+    """Create missing collections and indexes without deleting or reseeding data."""
     database = db()
     database.command("ping")
-    companies = database.companies
-    companies.create_index([("domain", ASCENDING)], unique=True, partialFilterExpression={"domain": {"$type": "string"}})
-    companies.create_index([("external_keys", ASCENDING)], unique=True, partialFilterExpression={"external_keys": {"$type": "string"}})
-    companies.create_index([("name_normalized", ASCENDING), ("location.country_code", ASCENDING)])
-    companies.create_index([("location.country_code", ASCENDING), ("industry", ASCENDING), ("prospect_score", DESCENDING)])
-    companies.create_index([("funding.total_amount_usd", DESCENDING)])
-    companies.create_index([("funding.last_funding_date", DESCENDING)])
-    companies.create_index([("employees.min", ASCENDING)])
-    companies.create_index([("founded_year", DESCENDING)])
-    companies.create_index([("signals.growth_score", DESCENDING)])
-    companies.create_index([("prospect_score", DESCENDING)])
-    companies.create_index([("demo", ASCENDING)])
-    database.saved_companies.create_index([("user_id", ASCENDING), ("company_id", ASCENDING)], unique=True)
-    database.outreach.create_index([("user_id", ASCENDING), ("company_id", ASCENDING)])
-    database.searches.create_index([("user_id", ASCENDING), ("created_at", DESCENDING)])
-    database.jobs.create_index([("created_at", DESCENDING)])
-    database.provider_cache.create_index([("expires_at", ASCENDING)], expireAfterSeconds=0)
-    database.provider_cache.create_index([("provider", ASCENDING), ("key", ASCENDING)], unique=True)
-    database.api_usage.create_index([("provider", ASCENDING), ("date", ASCENDING)], unique=True)
+    existing = set(database.list_collection_names())
+    created = []
+    for name in REQUIRED_COLLECTIONS:
+        if name not in existing:
+            database.create_collection(name)
+            created.append(name)
+    indexes_created = []
+    for collection_name, specifications in INDEXES.items():
+        collection = database[collection_name]
+        known = collection.index_information()
+        for name, keys, options in specifications:
+            if name in known:
+                if list(known[name].get("key", [])) != keys:
+                    raise RuntimeError(f"Index definition mismatch: {collection_name}.{name}")
+                continue
+            collection.create_index(keys, name=name, **options)
+            indexes_created.append(f"{collection_name}.{name}")
+    return {"database": database.name, "collections": list(REQUIRED_COLLECTIONS),
+            "collections_created": created, "indexes_created": indexes_created,
+            "indexes_total": sum(len(v) for v in INDEXES.values())}
