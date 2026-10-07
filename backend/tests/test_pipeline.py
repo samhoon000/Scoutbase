@@ -5,6 +5,7 @@ from app.pipeline import upsert_candidate
 from app.pipeline import run_discovery
 from app.database import db
 from app.database import client as mongo_client
+from app.config import settings
 from app.normalize import domain_from_url, normalized_name
 from app.scoring import score_company
 import pytest
@@ -14,9 +15,13 @@ from unittest.mock import patch
 
 @pytest.fixture(autouse=True)
 def fresh_demo_database():
+    original_uri, original_demo = settings.mongodb_uri, settings.demo_mode
+    settings.mongodb_uri = ""
+    settings.demo_mode = True
     mongo_client.cache_clear()
     yield
     mongo_client.cache_clear()
+    settings.mongodb_uri, settings.demo_mode = original_uri, original_demo
 
 
 def test_normalization():
@@ -68,10 +73,10 @@ def test_discovery_continues_after_provider_failure():
         async def search(self, criteria):
             return [CompanyCandidate(name="Real Test Company", location={"country_code": "US"}, source_name="Working", source_url="https://example.org/source")]
     with TestClient(app):
-        db().jobs.insert_one({"_id": "test-job", "status": "queued"})
+        db().discovery_jobs.insert_one({"_id": "test-job", "status": "queued"})
         with patch("app.pipeline.live_providers", return_value=[Broken(), Working()]):
             asyncio.run(run_discovery("test-job", __import__("app.models", fromlist=["SearchCriteria"]).SearchCriteria(query="Real")))
-        result = db().jobs.find_one({"_id": "test-job"})
+        result = db().discovery_jobs.find_one({"_id": "test-job"})
         assert result["status"] == "completed"
         assert result["inserted"] == 1
         assert len(result["errors"]) == 1
